@@ -1,0 +1,1139 @@
+---
+title: "Zanzibar red colobus helminth manuscript analysis"
+output: html_document
+---
+
+# Overview
+
+Analysis code for the manuscript *Gastrointestinal helminth infections in the Zanzibar red colobus monkeys (Piliocolobus kirkii)*. The workflow starts from the `All_Samples` worksheet in the master dataset and reproduces the analyses and figures reported in the manuscript and supplementary material.
+
+# 1. Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(readxl)
+library(lme4)
+library(emmeans)
+library(DescTools)
+library(rstatix)
+library(ggsignif)
+library(DiagrammeR)
+library(DiagrammeRsvg)
+library(rsvg)
+```
+
+```{r load-data}
+data_raw <- read_excel("ZRC_helminth_data.xlsx", sheet = "All_Samples")
+```
+
+# 2. Data preparation
+
+```{r prepare-data}
+data <- data_raw %>%
+  mutate(
+    parasite_taxon = na_if(trimws(parasite_taxon), ""),
+    year = factor(year),
+    protocol = factor(protocol),
+    method = factor(method, levels = c("DS", "FL", "SD")),
+    slide = as.integer(slide),
+    ID = trimws(ID),
+    ID = recode(ID,
+      `Droopy lip` = "Droopy Lip",
+      `Tight lip` = "Tight Lip"
+    ),
+    known_ID = ID != "UNK",
+    individual_ID = if_else(
+      known_ID,
+      paste(group, ID, sep = "_"),
+      NA_character_
+    ),
+    individual_ID = factor(individual_ID),
+    detected = as.integer(!is.na(parasite_taxon))
+  )
+
+main_data <- data %>%
+  filter(year %in% c("2023", "2024"))
+
+sample_data <- main_data %>%
+  group_by(
+    code, sample, group, ID, known_ID, individual_ID,
+    lab, year, protocol, storage_time
+  ) %>%
+  summarise(
+    positive = as.integer(any(!is.na(parasite_taxon))),
+    richness = n_distinct(parasite_taxon[!is.na(parasite_taxon)]),
+    .groups = "drop"
+  )
+
+single_slide <- main_data %>%
+  filter(slide == 1)
+
+single_slide_samples <- single_slide %>%
+  group_by(
+    code, sample, group, ID, known_ID, individual_ID,
+    lab, year, protocol, storage_time
+  ) %>%
+  summarise(
+    positive = as.integer(any(!is.na(parasite_taxon))),
+    richness = n_distinct(parasite_taxon[!is.na(parasite_taxon)]),
+    .groups = "drop"
+  )
+
+method_single_slide <- single_slide %>%
+  group_by(
+    code, sample, group, ID, known_ID, individual_ID,
+    lab, year, protocol, method
+  ) %>%
+  summarise(
+    positive = as.integer(any(!is.na(parasite_taxon))),
+    .groups = "drop"
+  )
+
+data_2024 <- data %>%
+  filter(year == "2024", protocol == "centrifugal")
+
+cumulative_screening_effort <- data_2024 %>%
+  crossing(slides_examined = 1:4) %>%
+  filter(slide <= slides_examined) %>%
+  group_by(code, slides_examined) %>%
+  summarise(
+    positive = as.integer(any(!is.na(parasite_taxon))),
+    richness = n_distinct(parasite_taxon[!is.na(parasite_taxon)]),
+    .groups = "drop"
+  )
+
+data_2025 <- data %>%
+  filter(year == "2025")
+
+protocol_2025_samples <- data_2025 %>%
+  group_by(sample, ID, individual_ID, group, protocol) %>%
+  summarise(
+    positive = as.integer(any(!is.na(parasite_taxon))),
+    richness = n_distinct(parasite_taxon[!is.na(parasite_taxon)]),
+    .groups = "drop"
+  )
+
+protocol_2025_wide <- protocol_2025_samples %>%
+  pivot_wider(
+    names_from = protocol,
+    values_from = c(positive, richness)
+  )
+```
+
+# 3. Descriptive results
+
+## Sample positivity and richness
+
+```{r overall-descriptives}
+overall_summary <- sample_data %>%
+  group_by(year) %>%
+  summarise(
+    n_samples = n(),
+    n_positive = sum(positive),
+    percent_positive = 100 * mean(positive),
+    mean_richness = mean(richness),
+    sd_richness = sd(richness),
+    .groups = "drop"
+  )
+
+overall_summary
+
+sample_data %>%
+  summarise(
+    n_samples = n(),
+    n_positive = sum(positive),
+    percent_positive = 100 * mean(positive),
+    mean_richness = mean(richness),
+    sd_richness = sd(richness),
+    min_richness = min(richness),
+    max_richness = max(richness)
+  )
+```
+
+## Taxon detection
+
+```{r taxon-detection}
+sample_taxa <- main_data %>%
+  filter(!is.na(parasite_taxon)) %>%
+  distinct(code, year, parasite_taxon)
+
+taxon_detection_overall <- sample_taxa %>%
+  count(parasite_taxon, name = "n_positive") %>%
+  mutate(
+    n_samples = n_distinct(main_data$code),
+    percent_positive = 100 * n_positive / n_samples
+  ) %>%
+  arrange(desc(percent_positive))
+
+taxon_detection_by_year <- sample_taxa %>%
+  count(year, parasite_taxon, name = "n_positive") %>%
+  left_join(sample_data %>% count(year, name = "n_samples"), by = "year") %>%
+  mutate(percent_positive = 100 * n_positive / n_samples) %>%
+  arrange(year, desc(percent_positive))
+
+taxon_detection_overall
+taxon_detection_by_year
+```
+
+## Co-infection
+
+```{r coinfection-descriptives}
+coinfection_full <- sample_data %>%
+  summarise(
+    n_samples = n(),
+    n_positive = sum(richness > 0),
+    n_coinfected = sum(richness > 1),
+    percent_all_samples = 100 * n_coinfected / n_samples,
+    percent_positive_samples = 100 * n_coinfected / n_positive
+  )
+
+coinfection_full
+```
+
+## Identified individuals and repeated sampling
+
+```{r sampling-structure}
+sampling_structure <- sample_data %>%
+  group_by(year) %>%
+  summarise(
+    total_samples = n(),
+    identified_samples = sum(known_ID),
+    percent_identified = 100 * identified_samples / total_samples,
+    unique_individuals = n_distinct(individual_ID[known_ID]),
+    .groups = "drop"
+  )
+
+samples_per_individual <- sample_data %>%
+  filter(known_ID) %>%
+  count(year, individual_ID, name = "n_samples")
+
+repeated_sampling_summary <- samples_per_individual %>%
+  group_by(year) %>%
+  summarise(
+    unique_individuals = n(),
+    mean_samples = mean(n_samples),
+    median_samples = median(n_samples),
+    min_samples = min(n_samples),
+    max_samples = max(n_samples),
+    .groups = "drop"
+  )
+
+sampling_structure
+repeated_sampling_summary
+```
+
+# 4. Standardised 2023–2024 comparison
+
+The between-period analyses use one slide per coproscopic technique in both sampling periods.
+
+## Overall sample positivity
+
+```{r positivity-glmm}
+positivity_model <- glmer(
+  positive ~ year + (1 | group),
+  data = single_slide_samples,
+  family = binomial,
+  control = glmerControl(
+    optimizer = "bobyqa",
+    optCtrl = list(maxfun = 100000)
+  )
+)
+
+summary(positivity_model)
+```
+
+## Helminth richness
+
+```{r richness-glmm}
+richness_model <- glmer(
+  richness ~ year + (1 | group),
+  data = single_slide_samples,
+  family = poisson,
+  control = glmerControl(
+    optimizer = "bobyqa",
+    optCtrl = list(maxfun = 100000)
+  )
+)
+
+summary(richness_model)
+```
+
+## Co-infection
+
+```{r coinfection-glmm}
+coinfection_data <- single_slide_samples %>%
+  mutate(coinfected = as.integer(richness >= 2))
+
+coinfection_summary <- coinfection_data %>%
+  group_by(year) %>%
+  summarise(
+    n_samples = n(),
+    n_coinfected = sum(coinfected),
+    percent_coinfected = 100 * mean(coinfected),
+    .groups = "drop"
+  )
+
+coinfection_model <- glmer(
+  coinfected ~ year + (1 | group),
+  data = coinfection_data,
+  family = binomial,
+  control = glmerControl(
+    optimizer = "bobyqa",
+    optCtrl = list(maxfun = 100000)
+  )
+)
+
+coinfection_null <- glmer(
+  coinfected ~ 1 + (1 | group),
+  data = coinfection_data,
+  family = binomial,
+  control = glmerControl(
+    optimizer = "bobyqa",
+    optCtrl = list(maxfun = 100000)
+  )
+)
+
+coinfection_summary
+anova(coinfection_null, coinfection_model, test = "Chisq")
+```
+
+# 5. Coproscopic technique by sampling period
+
+```{r technique-glmm}
+detection_model_data <- method_single_slide %>%
+  mutate(
+    year = factor(year),
+    method = factor(method, levels = c("DS", "FL", "SD")),
+    group = factor(group),
+    code = factor(code)
+  )
+
+detection_model_no_interaction <- glmer(
+  positive ~ year + method + (1 | group) + (1 | code),
+  data = detection_model_data,
+  family = binomial,
+  control = glmerControl(
+    optimizer = "bobyqa",
+    optCtrl = list(maxfun = 100000)
+  )
+)
+
+detection_model <- glmer(
+  positive ~ year * method + (1 | group) + (1 | code),
+  data = detection_model_data,
+  family = binomial,
+  control = glmerControl(
+    optimizer = "bobyqa",
+    optCtrl = list(maxfun = 100000)
+  )
+)
+
+anova(detection_model_no_interaction, detection_model, test = "Chisq")
+summary(detection_model)
+```
+
+```{r technique-contrasts}
+method_emm <- emmeans(detection_model, ~ method | year, type = "response")
+pairs(method_emm, adjust = "tukey")
+
+year_emm <- emmeans(detection_model, ~ year | method, type = "response")
+
+year_contrasts <- contrast(year_emm, method = "pairwise", adjust = "none") %>%
+  summary(type = "response") %>%
+  as.data.frame() %>%
+  mutate(p_holm = p.adjust(p.value, method = "holm"))
+
+year_contrasts
+```
+
+# 6. Screening effort in 2024
+
+## Sample positivity
+
+```{r screening-positivity}
+screening_summary <- cumulative_screening_effort %>%
+  group_by(slides_examined) %>%
+  summarise(
+    n_samples = n(),
+    n_positive = sum(positive),
+    percent_positive = 100 * mean(positive),
+    mean_richness = mean(richness),
+    .groups = "drop"
+  )
+
+screening_positive_wide <- cumulative_screening_effort %>%
+  select(code, slides_examined, positive) %>%
+  pivot_wider(
+    names_from = slides_examined,
+    values_from = positive,
+    names_prefix = "slides_"
+  )
+
+cochran_result <- CochranQTest(
+  as.matrix(screening_positive_wide %>% select(slides_1:slides_4))
+)
+
+screening_summary
+cochran_result
+```
+
+```{r screening-positivity-pairwise}
+exact_screening_comparison <- function(data, slide_a, slide_b) {
+  wide <- data %>%
+    filter(slides_examined %in% c(slide_a, slide_b)) %>%
+    select(code, slides_examined, positive) %>%
+    pivot_wider(
+      names_from = slides_examined,
+      values_from = positive,
+      names_prefix = "slide_"
+    )
+
+  a <- wide[[paste0("slide_", slide_a)]]
+  b <- wide[[paste0("slide_", slide_b)]]
+
+  lost <- sum(a == 1 & b == 0)
+  gained <- sum(a == 0 & b == 1)
+  discordant <- lost + gained
+
+  p <- if (discordant > 0) {
+    binom.test(gained, discordant, p = 0.5)$p.value
+  } else {
+    1
+  }
+
+  tibble(
+    comparison = paste(slide_a, "vs", slide_b),
+    gained_detection = gained,
+    lost_detection = lost,
+    discordant_pairs = discordant,
+    p_value = p
+  )
+}
+
+screening_pairwise <- bind_rows(
+  exact_screening_comparison(cumulative_screening_effort, 1, 2),
+  exact_screening_comparison(cumulative_screening_effort, 2, 3),
+  exact_screening_comparison(cumulative_screening_effort, 3, 4),
+  exact_screening_comparison(cumulative_screening_effort, 2, 4),
+  exact_screening_comparison(cumulative_screening_effort, 1, 4)
+) %>%
+  mutate(p_holm = p.adjust(p_value, method = "holm"))
+
+screening_pairwise
+```
+
+## Richness
+
+```{r screening-richness}
+screening_richness_wide <- cumulative_screening_effort %>%
+  select(code, slides_examined, richness) %>%
+  pivot_wider(
+    names_from = slides_examined,
+    values_from = richness,
+    names_prefix = "slides_"
+  )
+
+friedman_result <- friedman.test(
+  as.matrix(screening_richness_wide %>% select(slides_1:slides_4))
+)
+
+richness_comparisons <- list(
+  "1 vs 2" = c("slides_1", "slides_2"),
+  "2 vs 3" = c("slides_2", "slides_3"),
+  "3 vs 4" = c("slides_3", "slides_4"),
+  "2 vs 4" = c("slides_2", "slides_4"),
+  "1 vs 4" = c("slides_1", "slides_4")
+)
+
+richness_pairwise <- map_dfr(names(richness_comparisons), function(comp) {
+  vars <- richness_comparisons[[comp]]
+  test <- wilcox.test(
+    screening_richness_wide[[vars[1]]],
+    screening_richness_wide[[vars[2]]],
+    paired = TRUE,
+    exact = FALSE
+  )
+
+  tibble(
+    comparison = comp,
+    mean_first = mean(screening_richness_wide[[vars[1]]]),
+    mean_second = mean(screening_richness_wide[[vars[2]]]),
+    V = unname(test$statistic),
+    p_value = test$p.value
+  )
+}) %>%
+  mutate(p_holm = p.adjust(p_value, method = "holm"))
+
+richness_gains <- screening_richness_wide %>%
+  summarise(
+    gained_1_to_2 = sum(slides_2 > slides_1),
+    gained_2_to_3 = sum(slides_3 > slides_2),
+    gained_3_to_4 = sum(slides_4 > slides_3),
+    gained_2_to_4 = sum(slides_4 > slides_2)
+  )
+
+friedman_result
+richness_pairwise
+richness_gains
+```
+
+# 7. Individuals sampled in both periods
+
+All standardised faecal samples from the 15 identified individuals sampled in both 2023 and 2024 are retained.
+
+```{r matched-data}
+IDs_both_years <- single_slide_samples %>%
+  filter(known_ID) %>%
+  distinct(individual_ID, year) %>%
+  count(individual_ID, name = "n_years") %>%
+  filter(n_years == 2) %>%
+  pull(individual_ID)
+
+matched_repeated <- single_slide_samples %>%
+  filter(known_ID, individual_ID %in% IDs_both_years) %>%
+  droplevels()
+
+matched_repeated %>%
+  summarise(
+    n_samples = n(),
+    n_individuals = n_distinct(individual_ID)
+  )
+
+matched_repeated %>% count(year)
+```
+
+```{r matched-positivity}
+matched_positive_model <- glmer(
+  positive ~ year + (1 | individual_ID),
+  data = matched_repeated,
+  family = binomial,
+  control = glmerControl(
+    optimizer = "bobyqa",
+    optCtrl = list(maxfun = 100000)
+  )
+)
+
+matched_positive_null <- glmer(
+  positive ~ 1 + (1 | individual_ID),
+  data = matched_repeated,
+  family = binomial,
+  control = glmerControl(
+    optimizer = "bobyqa",
+    optCtrl = list(maxfun = 100000)
+  )
+)
+
+matched_repeated %>%
+  group_by(year) %>%
+  summarise(
+    n_samples = n(),
+    n_positive = sum(positive),
+    percent_positive = 100 * mean(positive),
+    .groups = "drop"
+  )
+
+anova(matched_positive_null, matched_positive_model, test = "Chisq")
+```
+
+```{r matched-richness}
+matched_richness_model <- glmer(
+  richness ~ year + (1 | individual_ID),
+  data = matched_repeated,
+  family = poisson,
+  control = glmerControl(
+    optimizer = "bobyqa",
+    optCtrl = list(maxfun = 100000)
+  )
+)
+
+matched_richness_null <- glmer(
+  richness ~ 1 + (1 | individual_ID),
+  data = matched_repeated,
+  family = poisson,
+  control = glmerControl(
+    optimizer = "bobyqa",
+    optCtrl = list(maxfun = 100000)
+  )
+)
+
+matched_repeated %>%
+  group_by(year) %>%
+  summarise(
+    n_samples = n(),
+    mean_richness = mean(richness),
+    sd_richness = sd(richness),
+    .groups = "drop"
+  )
+
+anova(matched_richness_null, matched_richness_model, test = "Chisq")
+```
+
+# 8. 2025 paired protocol comparison
+
+```{r protocol-2025-descriptives}
+protocol_2025_samples %>%
+  group_by(protocol) %>%
+  summarise(
+    n = n(),
+    n_positive = sum(positive),
+    percent_positive = 100 * mean(positive),
+    mean_richness = mean(richness),
+    sd_richness = sd(richness),
+    .groups = "drop"
+  )
+```
+
+```{r protocol-2025-tests}
+tab_2025 <- table(
+  protocol_2025_wide$positive_fieldfriendly,
+  protocol_2025_wide$positive_centrifugal
+)
+
+fieldfriendly_only <- tab_2025["1", "0"]
+centrifugal_only <- tab_2025["0", "1"]
+
+exact_mcnemar_2025 <- binom.test(
+  x = fieldfriendly_only,
+  n = fieldfriendly_only + centrifugal_only,
+  p = 0.5,
+  alternative = "two.sided"
+)
+
+wilcox_2025 <- wilcox.test(
+  protocol_2025_wide$richness_fieldfriendly,
+  protocol_2025_wide$richness_centrifugal,
+  paired = TRUE,
+  exact = FALSE
+)
+
+tab_2025
+exact_mcnemar_2025
+wilcox_2025
+```
+
+# 9. Laboratory sensitivity analyses
+
+```{r laboratory-sensitivity}
+lab_2024_samples <- single_slide_samples %>%
+  filter(year == "2024")
+
+lab_positivity_model <- glmer(
+  positive ~ lab + (1 | group),
+  data = lab_2024_samples,
+  family = binomial,
+  control = glmerControl(
+    optimizer = "bobyqa",
+    optCtrl = list(maxfun = 100000)
+  )
+)
+
+lab_richness_model <- glmer(
+  richness ~ lab + (1 | group),
+  data = lab_2024_samples,
+  family = poisson,
+  control = glmerControl(
+    optimizer = "bobyqa",
+    optCtrl = list(maxfun = 100000)
+  )
+)
+
+summary(lab_positivity_model)
+summary(lab_richness_model)
+```
+
+# 10. Storage-time sensitivity analyses
+
+These models provide the results reported in Supplementary Table S2.
+
+```{r storage-time}
+storage_2023_2024 <- sample_data %>%
+  select(year, positive, richness, storage_time) %>%
+  mutate(storage_time = as.numeric(storage_time))
+
+storage_2025 <- protocol_2025_samples %>%
+  left_join(
+    data_2025 %>% distinct(sample, protocol, storage_time),
+    by = c("sample", "protocol")
+  ) %>%
+  transmute(
+    year = factor("2025", levels = levels(data$year)),
+    positive,
+    richness,
+    storage_time = as.numeric(storage_time)
+  )
+
+storage_data <- bind_rows(storage_2023_2024, storage_2025)
+
+storage_models <- list(
+  positivity_2023 = glm(
+    positive ~ storage_time,
+    data = filter(storage_data, year == "2023"),
+    family = binomial
+  ),
+  positivity_2024 = glm(
+    positive ~ storage_time,
+    data = filter(storage_data, year == "2024"),
+    family = binomial
+  ),
+  positivity_2025 = glm(
+    positive ~ storage_time,
+    data = filter(storage_data, year == "2025"),
+    family = binomial
+  ),
+  richness_2023 = glm(
+    richness ~ storage_time,
+    data = filter(storage_data, year == "2023"),
+    family = poisson
+  ),
+  richness_2024 = glm(
+    richness ~ storage_time,
+    data = filter(storage_data, year == "2024"),
+    family = poisson
+  ),
+  richness_2025 = glm(
+    richness ~ storage_time,
+    data = filter(storage_data, year == "2025"),
+    family = poisson
+  )
+)
+
+map(storage_models, summary)
+```
+
+# 11. Main figures
+
+## Figure 1. Protocol comparison
+
+```{r figure-1-protocol}
+protocol_comparison <- grViz("
+digraph protocol_comparison {
+
+  graph [
+    layout = dot,
+    rankdir = TB,
+    bgcolor = 'transparent',
+    splines = ortho,
+    nodesep = 0.35,
+    ranksep = 0.55,
+    margin = 0.2,
+    pad = 0.2
+  ]
+
+  node [
+    shape = box,
+    style = 'filled',
+    fontname = Helvetica,
+    fontsize = 15,
+    color = 'black',
+    penwidth = 1.2,
+    margin = 0.18
+  ]
+
+  edge [
+    color = 'black',
+    penwidth = 1.2,
+    arrowsize = 0.7
+  ]
+
+  protocol23 [
+    label = <
+      <TABLE BORDER='0' CELLBORDER='0' CELLSPACING='0' CELLPADDING='0'>
+        <TR><TD ALIGN='CENTER'><FONT POINT-SIZE='18'><B>2023 FIELD-FRIENDLY PROTOCOL</B></FONT></TD></TR>
+        <TR><TD HEIGHT='8'></TD></TR>
+        <TR><TD ALIGN='CENTER'>Partial homogenisation</TD></TR>
+        <TR><TD ALIGN='CENTER'>27–30% unbuffered formalin</TD></TR>
+        <TR><TD ALIGN='CENTER'>1 slide per technique</TD></TR>
+      </TABLE>
+    >,
+    fillcolor = 'lightgrey'
+  ]
+
+  ds23 [
+    label = <
+      <TABLE BORDER='0' CELLBORDER='0' CELLSPACING='0' CELLPADDING='0'>
+        <TR><TD ALIGN='CENTER'><B>Direct smear</B></TD></TR>
+        <TR><TD ALIGN='CENTER'>Faecal–formalin</TD></TR>
+        <TR><TD ALIGN='CENTER'>suspension</TD></TR>
+      </TABLE>
+    >,
+    fillcolor = 'white', width = 2.2, height = 0.9, fixedsize = true
+  ]
+
+  fl23 [
+    label = <
+      <TABLE BORDER='0' CELLBORDER='0' CELLSPACING='0' CELLPADDING='0'>
+        <TR><TD ALIGN='CENTER'><B>Flotation</B></TD></TR>
+        <TR><TD ALIGN='CENTER'>Saturated NaCl</TD></TR>
+        <TR><TD ALIGN='CENTER'>15 min</TD></TR>
+      </TABLE>
+    >,
+    fillcolor = 'white', width = 2.2, height = 0.9, fixedsize = true
+  ]
+
+  sd23 [
+    label = <
+      <TABLE BORDER='0' CELLBORDER='0' CELLSPACING='0' CELLPADDING='0'>
+        <TR><TD ALIGN='CENTER'><B>Sedimentation</B></TD></TR>
+        <TR><TD ALIGN='CENTER'>Water wash ×3</TD></TR>
+      </TABLE>
+    >,
+    fillcolor = 'white', width = 2.2, height = 0.9, fixedsize = true
+  ]
+
+  protocol24 [
+    label = <
+      <TABLE BORDER='0' CELLBORDER='0' CELLSPACING='0' CELLPADDING='0'>
+        <TR><TD ALIGN='CENTER'><FONT POINT-SIZE='18'><B>2024 CENTRIFUGAL PROTOCOL</B></FONT></TD></TR>
+        <TR><TD HEIGHT='8'></TD></TR>
+        <TR><TD ALIGN='CENTER'>Thorough homogenisation</TD></TR>
+        <TR><TD ALIGN='CENTER'>10% buffered formalin + 0.03% Eosin</TD></TR>
+        <TR><TD ALIGN='CENTER'>4 slides per technique</TD></TR>
+      </TABLE>
+    >,
+    fillcolor = 'lightgrey'
+  ]
+
+  processing24 [
+    label = <
+      <TABLE BORDER='0' CELLBORDER='0' CELLSPACING='0' CELLPADDING='0'>
+        <TR><TD ALIGN='CENTER'><B>CENTRIFUGAL PREPROCESSING</B></TD></TR>
+        <TR><TD ALIGN='CENTER'>Fine-mesh sieve</TD></TR>
+        <TR><TD ALIGN='CENTER'>Rinsed with water to 35 ml</TD></TR>
+        <TR><TD ALIGN='CENTER'>2000 rpm, 5 min</TD></TR>
+        <TR><TD ALIGN='CENTER'>Faecal sediment retained</TD></TR>
+      </TABLE>
+    >,
+    fillcolor = 'grey95'
+  ]
+
+  ds24 [
+    label = <
+      <TABLE BORDER='0' CELLBORDER='0' CELLSPACING='0' CELLPADDING='0'>
+        <TR><TD ALIGN='CENTER'><B>Direct smear</B></TD></TR>
+        <TR><TD ALIGN='CENTER'>Sieved faecal material</TD></TR>
+        <TR><TD ALIGN='CENTER'>+ water</TD></TR>
+      </TABLE>
+    >,
+    fillcolor = 'white', width = 2.2, height = 0.9, fixedsize = true
+  ]
+
+  fl24 [
+    label = <
+      <TABLE BORDER='0' CELLBORDER='0' CELLSPACING='0' CELLPADDING='0'>
+        <TR><TD ALIGN='CENTER'><B>Flotation</B></TD></TR>
+        <TR><TD ALIGN='CENTER'>Saturated NaCl</TD></TR>
+        <TR><TD ALIGN='CENTER'>2000 rpm, 5 min</TD></TR>
+      </TABLE>
+    >,
+    fillcolor = 'white', width = 2.2, height = 0.9, fixedsize = true
+  ]
+
+  sd24 [
+    label = <
+      <TABLE BORDER='0' CELLBORDER='0' CELLSPACING='0' CELLPADDING='0'>
+        <TR><TD ALIGN='CENTER'><B>Sedimentation</B></TD></TR>
+        <TR><TD ALIGN='CENTER'>0.9% NaCl wash ×4</TD></TR>
+      </TABLE>
+    >,
+    fillcolor = 'white', width = 2.2, height = 0.9, fixedsize = true
+  ]
+
+  protocol23 -> ds23
+  protocol23 -> fl23
+  protocol23 -> sd23
+  { rank = same; ds23; fl23; sd23 }
+
+  protocol24 -> processing24
+  processing24 -> ds24
+  processing24 -> fl24
+  processing24 -> sd24 [style = invis]
+  fl24 -> sd24
+  { rank = same; ds24; fl24; sd24 }
+
+  { rank = same; protocol23; protocol24 }
+  protocol23 -> protocol24 [style = invis, weight = 20]
+}
+")
+
+protocol_comparison
+```
+
+## Figure 2. Cumulative sample positivity
+
+```{r figure-2}
+figure_2 <- ggplot(
+  screening_summary,
+  aes(x = factor(slides_examined), y = percent_positive)
+) +
+  geom_col(fill = "darkgrey", colour = "black", width = 0.6) +
+  labs(
+    x = "Number of slides examined",
+    y = "Helminth-positive samples (%)"
+  ) +
+  theme_bw(base_size = 16) +
+  coord_cartesian(ylim = c(0, 70))
+
+figure_2
+```
+
+## Figure 3. Cumulative richness
+
+```{r figure-3}
+richness_plot_df <- cumulative_screening_effort %>%
+  mutate(
+    slide_label = factor(slides_examined, levels = 1:4),
+    richness_group = factor(richness, levels = 0:3)
+  )
+
+figure_3 <- ggplot(
+  richness_plot_df,
+  aes(x = slide_label, fill = richness_group)
+) +
+  geom_bar(position = "fill", width = 0.65, colour = "black") +
+  scale_y_continuous(
+    breaks = seq(0, 1, 0.2),
+    labels = scales::label_percent(),
+    limits = c(0, 1.04),
+    expand = expansion(mult = c(0, 0))
+  ) +
+  scale_fill_manual(
+    values = c(
+      "0" = "grey90",
+      "1" = "grey70",
+      "2" = "grey45",
+      "3" = "grey20"
+    )
+  ) +
+  labs(
+    x = "Number of slides examined",
+    y = "Samples (%)",
+    fill = "Helminth\nrichness"
+  ) +
+  theme_bw(base_size = 16)
+
+figure_3
+```
+
+## Figure 4. Technique-specific sample positivity
+
+```{r figure-4-data}
+method_labels <- c(
+  DS = "Direct smear",
+  FL = "Flotation",
+  SD = "Sedimentation"
+)
+
+figure_4_data <- method_single_slide %>%
+  group_by(year, method) %>%
+  summarise(
+    n_samples = n(),
+    n_positive = sum(positive),
+    percent_positive = 100 * mean(positive),
+    .groups = "drop"
+  ) %>%
+  rowwise() %>%
+  mutate(
+    ci_lower = 100 * binom.test(n_positive, n_samples)$conf.int[1],
+    ci_upper = 100 * binom.test(n_positive, n_samples)$conf.int[2]
+  ) %>%
+  ungroup() %>%
+  mutate(
+    year = factor(as.character(year), levels = c("2023", "2024")),
+    method = recode(as.character(method), !!!method_labels)
+  )
+
+figure_4_annotation <- tibble(
+  method = "Flotation",
+  year1 = "2023",
+  year2 = "2024",
+  y_position = 55,
+  annotations = "***"
+)
+```
+
+```{r figure-4}
+figure_4 <- ggplot(
+  figure_4_data,
+  aes(x = year, y = percent_positive, fill = year)
+) +
+  geom_col(width = 0.6, colour = "black") +
+  geom_errorbar(
+    aes(ymin = ci_lower, ymax = ci_upper),
+    width = 0.15
+  ) +
+  scale_fill_grey(start = 0.8, end = 0.4, guide = "none") +
+  facet_wrap(~method, nrow = 1) +
+  coord_cartesian(ylim = c(0, 60)) +
+  scale_y_continuous(
+    breaks = seq(0, 60, by = 10),
+    minor_breaks = seq(0, 60, by = 5)
+  ) +
+  labs(
+    x = "Year of sampling",
+    y = "Helminth-positive samples (%)"
+  ) +
+  theme_bw(base_size = 16) +
+  theme(panel.grid.major.x = element_blank()) +
+  geom_signif(
+    data = figure_4_annotation,
+    aes(
+      xmin = year1,
+      xmax = year2,
+      annotations = annotations,
+      y_position = y_position
+    ),
+    manual = TRUE,
+    tip_length = 0.01,
+    inherit.aes = FALSE
+  )
+
+figure_4
+```
+
+# 12. Supplementary figures
+
+## Figure S1. Technique-specific cumulative sample positivity
+
+```{r figure-s1}
+method_slide_detection <- main_data %>%
+  filter(year == "2024") %>%
+  mutate(
+    method = factor(
+      method,
+      levels = c("DS", "FL", "SD"),
+      labels = c("Direct smear", "Flotation", "Sedimentation")
+    )
+  ) %>%
+  crossing(slides_examined = 1:4) %>%
+  filter(slide <= slides_examined) %>%
+  group_by(code, method, slides_examined) %>%
+  summarise(
+    positive = any(!is.na(parasite_taxon)),
+    .groups = "drop"
+  ) %>%
+  group_by(method, slides_examined) %>%
+  summarise(
+    n_samples = n(),
+    n_positive = sum(positive),
+    percent_positive = 100 * n_positive / n_samples,
+    .groups = "drop"
+  )
+
+figure_S1 <- ggplot(
+  method_slide_detection,
+  aes(
+    x = slides_examined,
+    y = percent_positive,
+    linetype = method,
+    group = method
+  )
+) +
+  geom_line(linewidth = 0.8, colour = "black") +
+  geom_point(size = 2.5, colour = "black") +
+  scale_x_continuous(breaks = 1:4) +
+  scale_y_continuous(
+    breaks = seq(0, 50, by = 10),
+    limits = c(0, 50),
+    expand = expansion(mult = c(0, 0))
+  ) +
+  labs(
+    x = "Number of slides examined",
+    y = "Helminth-positive samples (%)",
+    linetype = "Method"
+  ) +
+  theme_bw(base_size = 16) +
+  theme(
+    panel.grid.major.x = element_blank(),
+    legend.position = "right"
+  )
+
+figure_S1
+```
+
+## Figure S2. Technique-specific cumulative richness
+
+```{r figure-s2}
+method_slide_richness <- main_data %>%
+  filter(year == "2024") %>%
+  mutate(
+    method = factor(
+      method,
+      levels = c("DS", "FL", "SD"),
+      labels = c("Direct smear", "Flotation", "Sedimentation")
+    )
+  ) %>%
+  crossing(slides_examined = 1:4) %>%
+  filter(slide <= slides_examined) %>%
+  group_by(code, method, slides_examined) %>%
+  summarise(
+    richness = n_distinct(parasite_taxon[!is.na(parasite_taxon)]),
+    .groups = "drop"
+  ) %>%
+  group_by(method, slides_examined) %>%
+  summarise(
+    mean_richness = mean(richness),
+    .groups = "drop"
+  )
+
+figure_S2 <- ggplot(
+  method_slide_richness,
+  aes(
+    x = slides_examined,
+    y = mean_richness,
+    linetype = method,
+    group = method
+  )
+) +
+  geom_line(linewidth = 0.8, colour = "black") +
+  geom_point(size = 2.5, colour = "black") +
+  scale_x_continuous(breaks = 1:4) +
+  scale_y_continuous(
+    breaks = seq(0, 1.0, by = 0.2),
+    limits = c(0, 1.3),
+    expand = expansion(mult = c(0, 0))
+  ) +
+  labs(
+    x = "Number of slides examined",
+    y = "Mean helminth richness\n(taxa per sample)",
+    linetype = "Method"
+  ) +
+  theme_bw(base_size = 16) +
+  theme(
+    panel.grid.major.x = element_blank(),
+    legend.position = "right"
+  )
+
+figure_S2
+```
+
+# 13. Export figures
+
+```{r export-figures, eval=FALSE}
+ggsave("Figure_2.png", figure_2, width = 17, height = 12, units = "cm", dpi = 300)
+ggsave("Figure_3.png", figure_3, width = 17, height = 12, units = "cm", dpi = 300)
+ggsave("Figure_4.png", figure_4, width = 17, height = 12, units = "cm", dpi = 300)
+ggsave("Figure_S1.png", figure_S1, width = 17, height = 12, units = "cm", dpi = 300)
+ggsave("Figure_S2.png", figure_S2, width = 17, height = 12, units = "cm", dpi = 300)
+
+svg_code <- DiagrammeRsvg::export_svg(protocol_comparison)
+rsvg::rsvg_png(
+  charToRaw(svg_code),
+  file = "Figure_1_protocol_comparison.png",
+  width = 8000
+)
+```
+
+# 14. Reproducibility
+
+```{r package-versions}
+packages <- c(
+  "tidyverse", "readxl", "lme4", "emmeans", "DescTools",
+  "rstatix", "ggsignif", "DiagrammeR", "DiagrammeRsvg", "rsvg"
+)
+
+setNames(lapply(packages, packageVersion), packages)
+```
+
+```{r session-info}
+sessionInfo()
+```
